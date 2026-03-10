@@ -1,0 +1,8 @@
+# Domain-Whitelist fuer M365 Guest Governance
+# Domains die beim Deaktivieren/Loeschen ignoriert werden
+# Eine Domain pro Zeile, Kommentare mit # moeglich
+#
+# Beispiele:
+# partner-firma.de
+# dienstleister.com
+# trusted-vendor.io
