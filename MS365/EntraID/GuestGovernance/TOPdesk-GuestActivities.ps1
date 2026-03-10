@@ -204,6 +204,11 @@ function Connect-TopDesk {
         TOPdesk API verwendet Basic Authentication.
         Benutzername = Operator Login-Name
         Passwort = Application Password (erstellt im Operator-Profil)
+
+        Credential-Reihenfolge:
+        1. Uebergebener -Credential Parameter
+        2. Gespeicherte Credentials (DPAPI-verschluesselt)
+        3. Interaktive Abfrage via Get-Credential
     #>
     [CmdletBinding()]
     param(
@@ -213,12 +218,25 @@ function Connect-TopDesk {
         [switch]$Force
     )
 
+    # 1. Bereits im Speicher?
     if ($Script:TopDeskConfig.Credential -and -not $Force) {
         Write-Host "[OK] Bereits authentifiziert." -ForegroundColor Green
         return $true
     }
 
+    $fromSaved = $false
+
     if (-not $Credential) {
+        # 2. Gespeicherte Credentials laden (DPAPI)
+        $savedCred = Get-SavedTopDeskCredential
+        if ($savedCred) {
+            $Credential = $savedCred
+            $fromSaved = $true
+        }
+    }
+
+    if (-not $Credential) {
+        # 3. Interaktive Abfrage
         Write-Host "`n--- TOPdesk Anmeldung ---" -ForegroundColor Cyan
         Write-Host "Benutzername: Operator Login-Name" -ForegroundColor Gray
         Write-Host "Passwort: Application Password (aus Operator-Profil > Autorisierung)" -ForegroundColor Gray
@@ -249,13 +267,39 @@ function Connect-TopDesk {
             Write-Host "  API-Version: $($response.version)" -ForegroundColor Gray
         }
 
+        # Im Speicher cachen
         $Script:TopDeskConfig.Credential = $Credential
+
+        # Anbieten zu speichern (nur wenn nicht bereits aus Datei geladen)
+        if (-not $fromSaved) {
+            $credPath = Get-TopDeskCredentialPath
+            $alreadySaved = Test-Path $credPath
+
+            if (-not $alreadySaved) {
+                Write-Host ""
+                $saveChoice = Read-Host "Credentials sicher speichern fuer zukuenftige Ausfuehrungen? (Ja/Nein)"
+                if ($saveChoice -in @("Ja", "J", "ja", "j")) {
+                    Save-TopDeskCredential -Credential $Credential
+                }
+            }
+        }
+
         return $true
     }
     catch {
-        $statusCode = $_.Exception.Response.StatusCode.value__
+        $statusCode = $null
+        if ($_.Exception.Response) {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+        }
+
         if ($statusCode -eq 401) {
             Write-Host "[FEHLER] Authentifizierung fehlgeschlagen (401). Bitte pruefen Sie Login und Application Password." -ForegroundColor Red
+            # Wenn gespeicherte Credentials fehlschlagen: loeschen und neu fragen
+            if ($fromSaved) {
+                Write-Host "  Gespeicherte Credentials sind ungueltig. Datei wird geloescht." -ForegroundColor DarkYellow
+                Remove-TopDeskCredential | Out-Null
+                Write-Host "  Bitte starten Sie das Skript erneut." -ForegroundColor Yellow
+            }
         }
         elseif ($statusCode -eq 403) {
             Write-Host "[FEHLER] Zugriff verweigert (403). API-Berechtigungen pruefen." -ForegroundColor Red
@@ -284,6 +328,105 @@ function Get-TopDeskAuthHeaders {
     return @{
         Authorization  = "Basic $base64"
         'Content-Type' = 'application/json; charset=utf-8'
+    }
+}
+
+# ============================================================================
+# Credential-Verwaltung (DPAPI-verschluesselt)
+# ============================================================================
+
+function Get-TopDeskCredentialPath {
+    <#
+    .SYNOPSIS
+        Gibt den Pfad zur verschluesselten Credential-Datei zurueck.
+    #>
+    return (Join-Path $PSScriptRoot "topdesk.credential")
+}
+
+function Save-TopDeskCredential {
+    <#
+    .SYNOPSIS
+        Speichert TOPdesk-Credentials sicher via DPAPI (Windows Data Protection API).
+    .DESCRIPTION
+        Die Credentials werden als verschluesselte XML-Datei gespeichert.
+        Die Verschluesselung ist an den aktuellen Windows-Benutzer UND die
+        Maschine gebunden. Die Datei kann nur vom selben Benutzer auf
+        derselben Maschine wieder entschluesselt werden.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [PSCredential]$Credential
+    )
+
+    $credPath = Get-TopDeskCredentialPath
+
+    try {
+        $Credential | Export-Clixml -Path $credPath -Force
+        Write-Host "[OK] Credentials sicher gespeichert: $credPath" -ForegroundColor Green
+        Write-Host "  Verschluesselung: DPAPI (Benutzer + Maschine)" -ForegroundColor Gray
+        Write-Host "  Benutzername: $($Credential.UserName)" -ForegroundColor Gray
+        return $true
+    }
+    catch {
+        Write-Warning "Credentials konnten nicht gespeichert werden: $_"
+        return $false
+    }
+}
+
+function Get-SavedTopDeskCredential {
+    <#
+    .SYNOPSIS
+        Laedt gespeicherte TOPdesk-Credentials aus der verschluesselten Datei.
+    .DESCRIPTION
+        Gibt $null zurueck wenn keine Datei vorhanden oder die Entschluesselung
+        fehlschlaegt (anderer Benutzer oder andere Maschine).
+    #>
+    [CmdletBinding()]
+    param()
+
+    $credPath = Get-TopDeskCredentialPath
+
+    if (-not (Test-Path $credPath)) {
+        return $null
+    }
+
+    try {
+        $credential = Import-Clixml -Path $credPath
+        if ($credential -is [PSCredential]) {
+            Write-Host "[OK] Gespeicherte Credentials geladen (Benutzer: $($credential.UserName))" -ForegroundColor Green
+            return $credential
+        }
+        Write-Warning "Credential-Datei hat ungueltiges Format."
+        return $null
+    }
+    catch {
+        Write-Warning "Gespeicherte Credentials konnten nicht entschluesselt werden."
+        Write-Host "  Moegliche Ursache: Anderer Windows-Benutzer oder andere Maschine." -ForegroundColor DarkYellow
+        Write-Host "  Loeschen Sie die Datei und speichern Sie die Credentials erneut." -ForegroundColor DarkYellow
+        return $null
+    }
+}
+
+function Remove-TopDeskCredential {
+    <#
+    .SYNOPSIS
+        Loescht die gespeicherte Credential-Datei.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $credPath = Get-TopDeskCredentialPath
+
+    if (Test-Path $credPath) {
+        Remove-Item -Path $credPath -Force
+        Write-Host "[OK] Gespeicherte Credentials geloescht." -ForegroundColor Green
+        $Script:TopDeskConfig.Credential = $null
+        return $true
+    }
+    else {
+        Write-Host "Keine gespeicherten Credentials vorhanden." -ForegroundColor Yellow
+        return $false
     }
 }
 
@@ -967,6 +1110,13 @@ function Show-TopDeskMenu {
         Write-Host "  [6] Konfiguration aendern" -ForegroundColor DarkGray
         Write-Host "      TOPdesk URL, Kategorien, Operator, etc." -ForegroundColor DarkGray
         Write-Host ""
+
+        # Credential-Status anzeigen
+        $credPath = Get-TopDeskCredentialPath
+        $credStatus = if (Test-Path $credPath) { "gespeichert" } else { "nicht gespeichert" }
+        Write-Host "  [7] Anmeldedaten verwalten" -ForegroundColor DarkGray
+        Write-Host "      Credentials sicher speichern/loeschen (Status: $credStatus)" -ForegroundColor DarkGray
+        Write-Host ""
         Write-Host "  [Q] Beenden" -ForegroundColor DarkGray
         Write-Host "========================================" -ForegroundColor Cyan
 
@@ -1074,6 +1224,62 @@ function Show-TopDeskMenu {
             # ===== 6. Konfiguration aendern =====
             "6" {
                 Initialize-TopDeskConfig -Force
+            }
+
+            # ===== 7. Anmeldedaten verwalten =====
+            "7" {
+                $credPath = Get-TopDeskCredentialPath
+                $credExists = Test-Path $credPath
+
+                Write-Host "`n--- Anmeldedaten verwalten ---" -ForegroundColor Cyan
+
+                if ($credExists) {
+                    $credInfo = Get-Item $credPath
+                    Write-Host "  Status   : Gespeichert" -ForegroundColor Green
+                    Write-Host "  Datei    : $credPath" -ForegroundColor Gray
+                    Write-Host "  Erstellt : $($credInfo.LastWriteTime.ToString('dd.MM.yyyy HH:mm'))" -ForegroundColor Gray
+                    Write-Host "  Schutz   : DPAPI (Windows-Benutzer + Maschine)" -ForegroundColor Gray
+                    Write-Host ""
+                    Write-Host "  [1] Neu speichern (ueberschreiben)" -ForegroundColor White
+                    Write-Host "  [2] Loeschen" -ForegroundColor Red
+                    Write-Host "  [3] Zurueck" -ForegroundColor DarkGray
+
+                    $credChoice = Read-Host "`nAuswahl"
+                    switch ($credChoice) {
+                        "1" {
+                            $newCred = Get-Credential -Message "Neue TOPdesk API Anmeldedaten"
+                            if ($newCred) {
+                                Save-TopDeskCredential -Credential $newCred
+                                # Verbindung mit neuen Credentials testen
+                                $Script:TopDeskConfig.Credential = $null
+                                Connect-TopDesk -Credential $newCred
+                            }
+                        }
+                        "2" {
+                            $confirmDel = Read-Host "Gespeicherte Credentials wirklich loeschen? (Ja/Nein)"
+                            if ($confirmDel -in @("Ja", "J", "ja", "j")) {
+                                Remove-TopDeskCredential
+                            }
+                        }
+                    }
+                }
+                else {
+                    Write-Host "  Status: Nicht gespeichert" -ForegroundColor Yellow
+                    Write-Host "  Aktuell werden Credentials bei jedem Start abgefragt." -ForegroundColor Gray
+                    Write-Host ""
+                    $saveNow = Read-Host "Aktuelle Credentials jetzt sicher speichern? (Ja/Nein)"
+                    if ($saveNow -in @("Ja", "J", "ja", "j")) {
+                        if ($Script:TopDeskConfig.Credential) {
+                            Save-TopDeskCredential -Credential $Script:TopDeskConfig.Credential
+                        }
+                        else {
+                            $newCred = Get-Credential -Message "TOPdesk API Anmeldedaten speichern"
+                            if ($newCred) {
+                                Save-TopDeskCredential -Credential $newCred
+                            }
+                        }
+                    }
+                }
             }
 
             # ===== Beenden =====
