@@ -1,0 +1,10 @@
+{
+    "BaseUrl": "https://firma.topdesk.net",
+    "Defaults": {
+        "Category": "",
+        "Subcategory": "",
+        "OperatorGroup": "",
+        "Operator": "",
+        "ActivityType": ""
+    }
+}
