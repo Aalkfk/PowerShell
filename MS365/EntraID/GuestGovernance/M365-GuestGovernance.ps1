@@ -8,7 +8,10 @@
 .NOTES
     Erfordert: Microsoft.Graph PowerShell SDK
     Berechtigungen: User.Read.All, AuditLog.Read.All, Directory.ReadWrite.All (fuer Cleanup)
+    Verwendet Beta-API fuer zuverlaessige SignInActivity-Daten und Sponsor-Abfragen.
 #>
+
+#Requires -Version 5.1
 
 [CmdletBinding()]
 param()
@@ -25,6 +28,18 @@ $Script:Config = @{
         "AuditLog.Read.All",
         "Directory.ReadWrite.All"
     )
+    # Beta-API Properties fuer zuverlaessige SignInActivity
+    GraphUserProperties   = @(
+        "id",
+        "displayName",
+        "mail",
+        "userPrincipalName",
+        "createdDateTime",
+        "accountEnabled",
+        "signInActivity",
+        "externalUserState",
+        "externalUserStateChangeDateTime"
+    )
 }
 
 # ============================================================================
@@ -39,7 +54,7 @@ function Test-Prerequisites {
     [CmdletBinding()]
     param()
 
-    $requiredModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.Users", "Microsoft.Graph.Identity.SignIns")
+    $requiredModules = @("Microsoft.Graph.Authentication")
     $missing = @()
 
     foreach ($mod in $requiredModules) {
@@ -97,6 +112,147 @@ function Connect-M365Governance {
     }
 }
 
+function Get-AllGraphPages {
+    <#
+    .SYNOPSIS
+        Ruft alle Seiten einer paginierten Graph-API-Antwort ab.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [Parameter()]
+        [hashtable]$Headers = @{}
+    )
+
+    $allResults = @()
+    $currentUri = $Uri
+
+    do {
+        $response = Invoke-MgGraphRequest -Method GET -Uri $currentUri -Headers $Headers
+        if ($response.value) {
+            $allResults += $response.value
+        }
+        $currentUri = $response.'@odata.nextLink'
+    } while ($currentUri)
+
+    return $allResults
+}
+
+function Get-GuestInviter {
+    <#
+    .SYNOPSIS
+        Ermittelt den Einlader/Sponsor eines Gastkontos ueber die Beta-API.
+        Prueft zuerst die Sponsor-Beziehung, dann Audit-Logs als Fallback.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$UserId,
+
+        [Parameter()]
+        [hashtable]$AuditCache = @{}
+    )
+
+    # 1. Versuch: Sponsor-Beziehung abfragen (Beta-API)
+    try {
+        $sponsors = Invoke-MgGraphRequest -Method GET `
+            -Uri "https://graph.microsoft.com/beta/users/$UserId/sponsors" `
+            -ErrorAction Stop
+
+        if ($sponsors.value -and $sponsors.value.Count -gt 0) {
+            $sponsor = $sponsors.value[0]
+            return [PSCustomObject]@{
+                InviterId   = $sponsor.id
+                InviterName = $sponsor.displayName
+                InviterMail = $sponsor.mail
+                Source       = "Sponsor"
+            }
+        }
+    }
+    catch {
+        # Sponsor-Endpunkt nicht verfuegbar oder keine Berechtigung - weiter mit Fallback
+    }
+
+    # 2. Versuch: Aus vorgeladenem Audit-Cache
+    if ($AuditCache.ContainsKey($UserId)) {
+        return $AuditCache[$UserId]
+    }
+
+    return [PSCustomObject]@{
+        InviterId   = $null
+        InviterName = "Unbekannt"
+        InviterMail = $null
+        Source       = "Nicht ermittelbar"
+    }
+}
+
+function Get-InvitationAuditCache {
+    <#
+    .SYNOPSIS
+        Laedt Audit-Log-Eintraege fuer Gasteinladungen und baut einen Lookup-Cache.
+        Audit-Logs sind auf max. 30 Tage begrenzt.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $cache = @{}
+
+    try {
+        Write-Host "  Lade Einladungs-Audit-Logs (letzte 30 Tage)..." -ForegroundColor Gray
+        $auditUri = "https://graph.microsoft.com/beta/auditLogs/directoryAudits?" +
+            "`$filter=activityDisplayName eq 'Invite external user'&" +
+            "`$top=500&" +
+            "`$select=targetResources,initiatedBy,activityDateTime"
+
+        $auditLogs = Get-AllGraphPages -Uri $auditUri
+
+        foreach ($log in $auditLogs) {
+            # Ziel-User-ID aus targetResources extrahieren
+            $targetId = $null
+            if ($log.targetResources) {
+                foreach ($target in $log.targetResources) {
+                    if ($target.type -eq "User" -and $target.id) {
+                        $targetId = $target.id
+                        break
+                    }
+                }
+            }
+
+            if ($targetId -and -not $cache.ContainsKey($targetId)) {
+                $initiator = $log.initiatedBy
+                $inviterName = "Unbekannt"
+                $inviterMail = $null
+                $inviterId = $null
+
+                if ($initiator.user) {
+                    $inviterName = $initiator.user.displayName
+                    $inviterMail = $initiator.user.userPrincipalName
+                    $inviterId = $initiator.user.id
+                }
+                elseif ($initiator.app) {
+                    $inviterName = "App: $($initiator.app.displayName)"
+                }
+
+                $cache[$targetId] = [PSCustomObject]@{
+                    InviterId   = $inviterId
+                    InviterName = $inviterName
+                    InviterMail = $inviterMail
+                    Source       = "Audit-Log"
+                }
+            }
+        }
+
+        Write-Host "  [OK] $($cache.Count) Einladungen aus Audit-Logs geladen." -ForegroundColor Gray
+    }
+    catch {
+        Write-Warning "  Audit-Logs konnten nicht geladen werden: $($_.Exception.Message)"
+    }
+
+    return $cache
+}
+
 function Get-GuestActivityStatus {
     <#
     .SYNOPSIS
@@ -108,19 +264,24 @@ function Get-GuestActivityStatus {
         [object]$User,
 
         [Parameter()]
+        [object]$InviterInfo,
+
+        [Parameter()]
         [datetime]$ReferenceDate = (Get-Date)
     )
 
-    $createdDate = if ($User.CreatedDateTime) { [datetime]$User.CreatedDateTime } else { $null }
+    $createdDate = if ($User.createdDateTime) { [datetime]$User.createdDateTime } else { $null }
     $lastSignIn  = $null
     $lastNonInteractive = $null
 
-    if ($User.SignInActivity) {
-        if ($User.SignInActivity.LastSignInDateTime) {
-            $lastSignIn = [datetime]$User.SignInActivity.LastSignInDateTime
+    # SignInActivity aus Beta-API (Hashtable, nicht Objekt)
+    $signInActivity = $User.signInActivity
+    if ($signInActivity) {
+        if ($signInActivity.lastSignInDateTime) {
+            $lastSignIn = [datetime]$signInActivity.lastSignInDateTime
         }
-        if ($User.SignInActivity.LastNonInteractiveSignInDateTime) {
-            $lastNonInteractive = [datetime]$User.SignInActivity.LastNonInteractiveSignInDateTime
+        if ($signInActivity.lastNonInteractiveSignInDateTime) {
+            $lastNonInteractive = [datetime]$signInActivity.lastNonInteractiveSignInDateTime
         }
     }
 
@@ -159,18 +320,43 @@ function Get-GuestActivityStatus {
         $isExpired = $true
     }
 
+    # Einladungsstatus mappen
+    $externalState = $User.externalUserState
+    $invitationStatus = switch ($externalState) {
+        "Accepted"          { "Akzeptiert" }
+        "PendingAcceptance" { "Ausstehend" }
+        default             { if ($externalState) { $externalState } else { "Unbekannt" } }
+    }
+
+    # Einladungsstatus-Flags
+    if ($externalState -eq "PendingAcceptance") {
+        $flags += "EINLADUNG_AUSSTEHEND"
+    }
+
+    # Einlader-Informationen
+    $inviterName = "Unbekannt"
+    $inviterMail = $null
+    if ($InviterInfo) {
+        $inviterName = $InviterInfo.InviterName
+        $inviterMail = $InviterInfo.InviterMail
+    }
+
     return [PSCustomObject]@{
-        UserId                = $User.Id
-        DisplayName           = $User.DisplayName
-        Mail                  = $User.Mail
-        UserPrincipalName     = $User.UserPrincipalName
+        UserId                = $User.id
+        DisplayName           = $User.displayName
+        Mail                  = $User.mail
+        UserPrincipalName     = $User.userPrincipalName
         CreatedDateTime       = $createdDate
         LastSignIn            = $lastSignIn
         LastNonInteractive    = $lastNonInteractive
         LastActivity          = $lastActivity
         DaysSinceActivity     = $daysSinceActivity
         DaysSinceCreation     = $daysSinceCreation
-        AccountEnabled        = $User.AccountEnabled
+        AccountEnabled        = $User.accountEnabled
+        InvitationStatus      = $invitationStatus
+        ExternalUserState     = $externalState
+        InviterName           = $inviterName
+        InviterMail           = $inviterMail
         IsInactive            = $isInactive
         IsExpired             = $isExpired
         Flags                 = ($flags -join "; ")
@@ -187,9 +373,10 @@ function Get-M365GuestReport {
     .SYNOPSIS
         Liest alle Gastkonten aus, prueft Aktivitaet und Alter, erstellt Berichte.
     .DESCRIPTION
-        - Liest alle Gastkonten aus Microsoft Entra ID
-        - Prueft letzte Anmeldung (inaktiv > 60 Tage)
+        - Liest alle Gastkonten ueber die Microsoft Graph Beta-API
+        - Prueft letzte Anmeldung (inaktiv > 60 Tage) inkl. nicht-interaktiver Sign-Ins
         - Prueft Erstellungsdatum (aelter als 365 Tage)
+        - Ermittelt Einladungsstatus und Einlader/Sponsor
         - Generiert HTML-Report (grafisch) und CSV + JSON (technisch)
     .PARAMETER OutputDirectory
         Zielverzeichnis fuer die Reports. Standard: ./Reports
@@ -197,6 +384,8 @@ function Get-M365GuestReport {
         Schwellenwert fuer Inaktivitaet in Tagen. Standard: 60
     .PARAMETER MaxAgeDays
         Maximales Kontoalter in Tagen. Standard: 365
+    .PARAMETER SkipInviterLookup
+        Ueberspringt die Einlader-Ermittlung (beschleunigt den Audit).
     .PARAMETER PassThru
         Gibt die Ergebnisse zusaetzlich als Objekte zurueck.
     .EXAMPLE
@@ -216,6 +405,9 @@ function Get-M365GuestReport {
         [int]$MaxAgeDays = $Script:Config.MaxAgeDaysThreshold,
 
         [Parameter()]
+        [switch]$SkipInviterLookup,
+
+        [Parameter()]
         [switch]$PassThru
     )
 
@@ -233,58 +425,96 @@ function Get-M365GuestReport {
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host " Inaktivitaet-Schwelle : $InactiveDays Tage"
     Write-Host " Max. Kontoalter       : $MaxAgeDays Tage"
+    Write-Host " Einlader-Abfrage      : $(if ($SkipInviterLookup) {'Uebersprungen'} else {'Aktiv'})"
     Write-Host " Ausgabeverzeichnis    : $OutputDirectory"
+    Write-Host " API-Endpunkt          : Beta (zuverlaessige SignInActivity)"
     Write-Host "========================================`n" -ForegroundColor Cyan
 
-    # Gastkonten abrufen
-    Write-Host "Lade Gastkonten aus Entra ID..." -ForegroundColor Yellow
+    # -----------------------------------------------------------------------
+    # Gastkonten ueber Beta-API abrufen (zuverlaessige SignInActivity-Daten)
+    # -----------------------------------------------------------------------
+    Write-Host "Lade Gastkonten ueber Graph Beta-API..." -ForegroundColor Yellow
+
+    $selectProperties = $Script:Config.GraphUserProperties -join ","
+    $graphUri = "https://graph.microsoft.com/beta/users?" +
+        "`$filter=userType eq 'Guest'&" +
+        "`$select=$selectProperties&" +
+        "`$count=true&" +
+        "`$top=999"
+
     try {
-        $guests = Get-MgUser -Filter "userType eq 'Guest'" -All `
-            -Property "Id,DisplayName,Mail,UserPrincipalName,CreatedDateTime,AccountEnabled,SignInActivity,ExternalUserState" `
-            -CountVariable guestCount `
-            -ConsistencyLevel eventual
+        $guests = Get-AllGraphPages -Uri $graphUri -Headers @{ "ConsistencyLevel" = "eventual" }
     }
     catch {
         Write-Error "Fehler beim Abrufen der Gastkonten: $_"
+        Write-Host "`nMoegliche Ursachen:" -ForegroundColor Yellow
+        Write-Host "  - Fehlende Berechtigung: AuditLog.Read.All (fuer SignInActivity)" -ForegroundColor Yellow
+        Write-Host "  - Fehlende Berechtigung: User.Read.All" -ForegroundColor Yellow
+        Write-Host "  - Verbindung nicht hergestellt (Connect-MgGraph)" -ForegroundColor Yellow
         return
     }
 
     $totalGuests = ($guests | Measure-Object).Count
-    Write-Host "[OK] $totalGuests Gastkonten gefunden.`n" -ForegroundColor Green
+    Write-Host "[OK] $totalGuests Gastkonten gefunden." -ForegroundColor Green
 
     if ($totalGuests -eq 0) {
         Write-Host "Keine Gastkonten vorhanden. Audit beendet." -ForegroundColor Yellow
         return
     }
 
+    # Debug: Pruefen ob SignInActivity geladen wurde
+    $withSignIn = ($guests | Where-Object { $_.signInActivity -ne $null } | Measure-Object).Count
+    Write-Host "  -> $withSignIn von $totalGuests mit SignInActivity-Daten" -ForegroundColor Gray
+
+    # -----------------------------------------------------------------------
+    # Einlader/Sponsor ermitteln
+    # -----------------------------------------------------------------------
+    $auditCache = @{}
+    if (-not $SkipInviterLookup) {
+        Write-Host "`nErmittle Einlader/Sponsoren..." -ForegroundColor Yellow
+        $auditCache = Get-InvitationAuditCache
+    }
+
+    # -----------------------------------------------------------------------
     # Aktivitaetsstatus ermitteln
-    Write-Host "Analysiere Aktivitaetsstatus..." -ForegroundColor Yellow
+    # -----------------------------------------------------------------------
+    Write-Host "`nAnalysiere Aktivitaetsstatus..." -ForegroundColor Yellow
     $results = @()
     $counter = 0
     foreach ($guest in $guests) {
         $counter++
         Write-Progress -Activity "Analysiere Gastkonten" -Status "$counter von $totalGuests" -PercentComplete (($counter / $totalGuests) * 100)
-        $results += Get-GuestActivityStatus -User $guest
+
+        # Einlader ermitteln
+        $inviterInfo = $null
+        if (-not $SkipInviterLookup) {
+            $inviterInfo = Get-GuestInviter -UserId $guest.id -AuditCache $auditCache
+        }
+
+        $results += Get-GuestActivityStatus -User $guest -InviterInfo $inviterInfo
     }
     Write-Progress -Activity "Analysiere Gastkonten" -Completed
 
     # Statistiken
+    $pendingCount = ($results | Where-Object { $_.InvitationStatus -eq "Ausstehend" }).Count
     $stats = [PSCustomObject]@{
-        Gesamt        = $totalGuests
-        Aktiv         = ($results | Where-Object { -not $_.IsInactive -and -not $_.IsExpired }).Count
-        Inaktiv       = ($results | Where-Object { $_.IsInactive }).Count
-        Abgelaufen    = ($results | Where-Object { $_.IsExpired }).Count
-        Deaktiviert   = ($results | Where-Object { -not $_.AccountEnabled }).Count
-        KriteriumHoch = ($results | Where-Object { $_.Severity -eq "Hoch" }).Count
+        Gesamt           = $totalGuests
+        Aktiv            = ($results | Where-Object { -not $_.IsInactive -and -not $_.IsExpired }).Count
+        Inaktiv          = ($results | Where-Object { $_.IsInactive }).Count
+        Abgelaufen       = ($results | Where-Object { $_.IsExpired }).Count
+        Deaktiviert      = ($results | Where-Object { -not $_.AccountEnabled }).Count
+        KriteriumHoch    = ($results | Where-Object { $_.Severity -eq "Hoch" }).Count
+        Ausstehend       = $pendingCount
     }
 
     Write-Host "`n--- Zusammenfassung ---" -ForegroundColor Cyan
-    Write-Host "  Gesamt           : $($stats.Gesamt)"
-    Write-Host "  Aktiv            : $($stats.Aktiv)" -ForegroundColor Green
-    Write-Host "  Inaktiv (>$InactiveDays d) : $($stats.Inaktiv)" -ForegroundColor Yellow
-    Write-Host "  Abgelaufen (>$MaxAgeDays d): $($stats.Abgelaufen)" -ForegroundColor Red
-    Write-Host "  Deaktiviert      : $($stats.Deaktiviert)" -ForegroundColor DarkGray
-    Write-Host "  Kritisch (beides): $($stats.KriteriumHoch)" -ForegroundColor Magenta
+    Write-Host "  Gesamt              : $($stats.Gesamt)"
+    Write-Host "  Aktiv               : $($stats.Aktiv)" -ForegroundColor Green
+    Write-Host "  Inaktiv (>$InactiveDays d)    : $($stats.Inaktiv)" -ForegroundColor Yellow
+    Write-Host "  Abgelaufen (>$MaxAgeDays d)  : $($stats.Abgelaufen)" -ForegroundColor Red
+    Write-Host "  Deaktiviert         : $($stats.Deaktiviert)" -ForegroundColor DarkGray
+    Write-Host "  Kritisch (beides)   : $($stats.KriteriumHoch)" -ForegroundColor Magenta
+    Write-Host "  Einladung ausstehend: $($stats.Ausstehend)" -ForegroundColor DarkYellow
     Write-Host ""
 
     # Timestamp fuer Dateinamen
@@ -304,6 +534,7 @@ function Get-M365GuestReport {
             InactiveDays      = $InactiveDays
             MaxAgeDays        = $MaxAgeDays
             TotalGuests       = $totalGuests
+            ApiEndpoint       = "Beta"
         }
         Statistics = $stats
         Guests     = $results
@@ -353,6 +584,15 @@ function New-GuestHtmlReport {
     $okCount          = ($okResults | Measure-Object).Count
     $complianceRate   = if ($Stats.Gesamt -gt 0) { [math]::Round(($okCount / $Stats.Gesamt) * 100, 1) } else { 100 }
 
+    # Einladungsstatus-Badge erzeugen
+    function Get-InvitationBadge($status) {
+        switch ($status) {
+            "Akzeptiert"  { return '<span class="badge badge-accepted">Akzeptiert</span>' }
+            "Ausstehend"  { return '<span class="badge badge-pending">Ausstehend</span>' }
+            default       { return '<span class="badge badge-unknown">Unbekannt</span>' }
+        }
+    }
+
     # Flagged Tabellenzeilen
     $flaggedRows = ""
     foreach ($r in $flaggedResults) {
@@ -362,19 +602,25 @@ function New-GuestHtmlReport {
             "Niedrig" { "severity-low" }
             default   { "" }
         }
-        $statusBadge = if ($r.AccountEnabled) { '<span class="badge badge-active">Aktiv</span>' } else { '<span class="badge badge-disabled">Deaktiviert</span>' }
-        $lastAct = if ($r.LastActivity) { $r.LastActivity.ToString("dd.MM.yyyy") } else { '<span class="no-data">Nie</span>' }
-        $created = if ($r.CreatedDateTime) { $r.CreatedDateTime.ToString("dd.MM.yyyy") } else { "Unbekannt" }
+        $statusBadge     = if ($r.AccountEnabled) { '<span class="badge badge-active">Aktiv</span>' } else { '<span class="badge badge-disabled">Deaktiviert</span>' }
+        $invitationBadge = Get-InvitationBadge $r.InvitationStatus
+        $lastAct         = if ($r.LastActivity) { $r.LastActivity.ToString("dd.MM.yyyy") } else { '<span class="no-data">Nie</span>' }
+        $lastSignInFmt   = if ($r.LastSignIn) { $r.LastSignIn.ToString("dd.MM.yyyy") } else { "-" }
+        $lastNonIntFmt   = if ($r.LastNonInteractive) { $r.LastNonInteractive.ToString("dd.MM.yyyy") } else { "-" }
+        $created         = if ($r.CreatedDateTime) { $r.CreatedDateTime.ToString("dd.MM.yyyy") } else { "Unbekannt" }
+        $inviterDisplay  = if ($r.InviterMail) { "<span title=`"$($r.InviterMail)`">$($r.InviterName)</span>" } else { $r.InviterName }
 
         $flaggedRows += @"
         <tr class="$severityClass">
             <td title="$($r.UserId)">$($r.DisplayName)</td>
             <td>$($r.Mail)</td>
             <td>$created</td>
-            <td>$lastAct</td>
+            <td title="Interaktiv: $lastSignInFmt | Nicht-interaktiv: $lastNonIntFmt">$lastAct</td>
             <td>$($r.DaysSinceActivity)</td>
             <td>$($r.DaysSinceCreation)</td>
             <td>$statusBadge</td>
+            <td>$invitationBadge</td>
+            <td>$inviterDisplay</td>
             <td><span class="severity-badge $severityClass">$($r.Severity)</span></td>
             <td class="flags">$($r.Flags)</td>
         </tr>
@@ -384,19 +630,25 @@ function New-GuestHtmlReport {
     # OK Tabellenzeilen
     $okRows = ""
     foreach ($r in $okResults) {
-        $statusBadge = if ($r.AccountEnabled) { '<span class="badge badge-active">Aktiv</span>' } else { '<span class="badge badge-disabled">Deaktiviert</span>' }
-        $lastAct = if ($r.LastActivity) { $r.LastActivity.ToString("dd.MM.yyyy") } else { '<span class="no-data">Nie</span>' }
-        $created = if ($r.CreatedDateTime) { $r.CreatedDateTime.ToString("dd.MM.yyyy") } else { "Unbekannt" }
+        $statusBadge     = if ($r.AccountEnabled) { '<span class="badge badge-active">Aktiv</span>' } else { '<span class="badge badge-disabled">Deaktiviert</span>' }
+        $invitationBadge = Get-InvitationBadge $r.InvitationStatus
+        $lastAct         = if ($r.LastActivity) { $r.LastActivity.ToString("dd.MM.yyyy") } else { '<span class="no-data">Nie</span>' }
+        $lastSignInFmt   = if ($r.LastSignIn) { $r.LastSignIn.ToString("dd.MM.yyyy") } else { "-" }
+        $lastNonIntFmt   = if ($r.LastNonInteractive) { $r.LastNonInteractive.ToString("dd.MM.yyyy") } else { "-" }
+        $created         = if ($r.CreatedDateTime) { $r.CreatedDateTime.ToString("dd.MM.yyyy") } else { "Unbekannt" }
+        $inviterDisplay  = if ($r.InviterMail) { "<span title=`"$($r.InviterMail)`">$($r.InviterName)</span>" } else { $r.InviterName }
 
         $okRows += @"
         <tr>
             <td title="$($r.UserId)">$($r.DisplayName)</td>
             <td>$($r.Mail)</td>
             <td>$created</td>
-            <td>$lastAct</td>
+            <td title="Interaktiv: $lastSignInFmt | Nicht-interaktiv: $lastNonIntFmt">$lastAct</td>
             <td>$($r.DaysSinceActivity)</td>
             <td>$($r.DaysSinceCreation)</td>
             <td>$statusBadge</td>
+            <td>$invitationBadge</td>
+            <td>$inviterDisplay</td>
             <td><span class="severity-badge severity-ok">OK</span></td>
         </tr>
 "@
@@ -427,7 +679,7 @@ function New-GuestHtmlReport {
             color: #323130;
             line-height: 1.5;
         }
-        .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+        .container { max-width: 1600px; margin: 0 auto; padding: 24px; }
 
         /* Header */
         .header {
@@ -443,7 +695,7 @@ function New-GuestHtmlReport {
         /* Stat Cards */
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
             gap: 16px;
             margin-bottom: 24px;
         }
@@ -463,6 +715,7 @@ function New-GuestHtmlReport {
         .stat-card.warn .stat-value { color: var(--warning); }
         .stat-card.danger .stat-value { color: var(--danger); }
         .stat-card.critical .stat-value { color: #881798; }
+        .stat-card.pending .stat-value { color: #ca5010; }
 
         /* Compliance Bar */
         .compliance-section {
@@ -532,14 +785,14 @@ function New-GuestHtmlReport {
         table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 14px;
+            font-size: 13px;
         }
         thead th {
             background: #f3f2f1;
-            padding: 12px 16px;
+            padding: 10px 12px;
             text-align: left;
             font-weight: 600;
-            font-size: 13px;
+            font-size: 12px;
             color: var(--muted);
             text-transform: uppercase;
             letter-spacing: 0.5px;
@@ -547,10 +800,11 @@ function New-GuestHtmlReport {
             position: sticky;
             top: 0;
             cursor: pointer;
+            white-space: nowrap;
         }
         thead th:hover { background: #e1dfdd; }
         tbody td {
-            padding: 10px 16px;
+            padding: 8px 12px;
             border-bottom: 1px solid var(--border);
         }
         tbody tr:hover { background: #f3f2f1; }
@@ -564,24 +818,29 @@ function New-GuestHtmlReport {
         .badge {
             padding: 3px 10px;
             border-radius: 12px;
-            font-size: 12px;
+            font-size: 11px;
             font-weight: 600;
+            white-space: nowrap;
         }
         .badge-active { background: #dff6dd; color: #107c10; }
         .badge-disabled { background: #f4f4f4; color: #605e5c; }
+        .badge-accepted { background: #dff6dd; color: #107c10; }
+        .badge-pending { background: #fff4ce; color: #8a6d3b; }
+        .badge-unknown { background: #f4f4f4; color: #605e5c; }
         .severity-badge {
             padding: 3px 10px;
             border-radius: 12px;
-            font-size: 12px;
+            font-size: 11px;
             font-weight: 600;
             color: white;
+            white-space: nowrap;
         }
         .severity-badge.severity-high { background: var(--danger); border: none; }
         .severity-badge.severity-medium { background: var(--warning); color: #323130; border: none; }
         .severity-badge.severity-low { background: var(--primary); border: none; }
         .severity-badge.severity-ok { background: var(--success); border: none; }
 
-        .flags { font-size: 12px; color: var(--muted); max-width: 220px; }
+        .flags { font-size: 11px; color: var(--muted); max-width: 220px; }
         .no-data { color: var(--danger); font-style: italic; }
 
         /* Collapsible */
@@ -608,6 +867,9 @@ function New-GuestHtmlReport {
             min-width: 250px;
         }
         .filter-bar input:focus { outline: none; border-color: var(--primary); }
+
+        /* Tooltip on hover for activity breakdown */
+        td[title] { cursor: help; }
 
         /* Footer */
         .footer {
@@ -637,6 +899,7 @@ function New-GuestHtmlReport {
                 <span>Tenant: $tenantId</span>
                 <span>Inaktivitaet: &gt;$InactiveDays Tage</span>
                 <span>Max. Alter: &gt;$MaxAgeDays Tage</span>
+                <span>API: Beta-Endpunkt</span>
             </div>
         </div>
 
@@ -644,6 +907,7 @@ function New-GuestHtmlReport {
         <div class="policy-info">
             <strong>Richtlinie:</strong> Gastkonten werden als <strong>inaktiv</strong> markiert, wenn keine Anmeldung innerhalb von <strong>$InactiveDays Tagen</strong> erfolgt ist.
             Konten, die aelter als <strong>$MaxAgeDays Tage</strong> sind, gelten als <strong>abgelaufen</strong> und muessen erneuert oder entfernt werden.
+            <br><em>Letzte Aktivitaet: Hover ueber das Datum zeigt die Aufschluesselung (interaktiv / nicht-interaktiv).</em>
         </div>
 
         <!-- Stats -->
@@ -667,6 +931,10 @@ function New-GuestHtmlReport {
             <div class="stat-card critical">
                 <div class="stat-value">$($Stats.KriteriumHoch)</div>
                 <div class="stat-label">Kritisch (beides)</div>
+            </div>
+            <div class="stat-card pending">
+                <div class="stat-value">$($Stats.Ausstehend)</div>
+                <div class="stat-label">Einladung ausstehend</div>
             </div>
             <div class="stat-card">
                 <div class="stat-value" style="color: var(--muted);">$($Stats.Deaktiviert)</div>
@@ -692,7 +960,7 @@ function New-GuestHtmlReport {
                 <span class="count">$flaggedCount</span>
             </div>
             <div class="filter-bar">
-                <input type="text" id="filterFlagged" placeholder="Filtern nach Name, E-Mail, Flags..." onkeyup="filterTable('flaggedTable', this.value)">
+                <input type="text" id="filterFlagged" placeholder="Filtern nach Name, E-Mail, Einlader, Flags..." onkeyup="filterTable('flaggedTable', this.value)">
             </div>
             <div style="overflow-x: auto;">
                 <table id="flaggedTable">
@@ -705,7 +973,9 @@ function New-GuestHtmlReport {
                             <th onclick="sortTable('flaggedTable', 4)">Tage inaktiv</th>
                             <th onclick="sortTable('flaggedTable', 5)">Alter (Tage)</th>
                             <th onclick="sortTable('flaggedTable', 6)">Status</th>
-                            <th onclick="sortTable('flaggedTable', 7)">Schwere</th>
+                            <th onclick="sortTable('flaggedTable', 7)">Einladung</th>
+                            <th onclick="sortTable('flaggedTable', 8)">Eingeladen von</th>
+                            <th onclick="sortTable('flaggedTable', 9)">Schwere</th>
                             <th>Flags</th>
                         </tr>
                     </thead>
@@ -724,7 +994,7 @@ function New-GuestHtmlReport {
             </div>
             <div id="okSection" class="collapsible-content">
                 <div class="filter-bar">
-                    <input type="text" id="filterOk" placeholder="Filtern nach Name, E-Mail..." onkeyup="filterTable('okTable', this.value)">
+                    <input type="text" id="filterOk" placeholder="Filtern nach Name, E-Mail, Einlader..." onkeyup="filterTable('okTable', this.value)">
                 </div>
                 <div style="overflow-x: auto;">
                     <table id="okTable">
@@ -737,6 +1007,8 @@ function New-GuestHtmlReport {
                                 <th onclick="sortTable('okTable', 4)">Tage inaktiv</th>
                                 <th onclick="sortTable('okTable', 5)">Alter (Tage)</th>
                                 <th onclick="sortTable('okTable', 6)">Status</th>
+                                <th onclick="sortTable('okTable', 7)">Einladung</th>
+                                <th onclick="sortTable('okTable', 8)">Eingeladen von</th>
                                 <th>Bewertung</th>
                             </tr>
                         </thead>
@@ -750,7 +1022,7 @@ function New-GuestHtmlReport {
 
         <!-- Footer -->
         <div class="footer">
-            M365 Guest Governance Tool &bull; Report generiert am $reportDate
+            M365 Guest Governance Tool &bull; Report generiert am $reportDate &bull; API: Beta-Endpunkt
         </div>
     </div>
 
@@ -954,13 +1226,17 @@ function Remove-M365GuestAccounts {
 
         try {
             if ($Action -eq "Disable") {
-                Update-MgUser -UserId $target.UserId -AccountEnabled:$false
+                # Beta-API fuer Konsistenz
+                Invoke-MgGraphRequest -Method PATCH `
+                    -Uri "https://graph.microsoft.com/v1.0/users/$($target.UserId)" `
+                    -Body @{ accountEnabled = $false } | Out-Null
                 Write-Host "  [OK] Deaktiviert: $name" -ForegroundColor Green
                 $results += [PSCustomObject]@{ UserId = $target.UserId; Name = $name; Action = "Disabled"; Status = "Success"; Error = "" }
                 $successCount++
             }
             else {
-                Remove-MgUser -UserId $target.UserId
+                Invoke-MgGraphRequest -Method DELETE `
+                    -Uri "https://graph.microsoft.com/v1.0/users/$($target.UserId)" | Out-Null
                 Write-Host "  [OK] Geloescht: $name" -ForegroundColor Green
                 $results += [PSCustomObject]@{ UserId = $target.UserId; Name = $name; Action = "Deleted"; Status = "Success"; Error = "" }
                 $successCount++
